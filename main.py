@@ -5,7 +5,7 @@ Nasdaq-100 DCA Discipline - VXN + NDX Data Proxy Backend
   VXN: CBOE 官方  https://cdn.cboe.com/api/global/us_indices/daily_prices/VXN_History.csv
   NDX: NASDAQ 官方 API（优先） / FRED NASDAQ100（降级） (用于计算回撤)
 
-规则版本：v4.0 (2026-11-21)
+规则版本：v4.1 (2026-11-21)
 
 Endpoints:
   GET /health              — 健康检查
@@ -34,7 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(
     title="NasdaqDCA VXN + Tier Proxy",
     description="VXN data + NDX drawdown + tier determination for Nasdaq-100 DCA discipline",
-    version="4.0.0",
+    version="4.1.0",
 )
 
 app.add_middleware(
@@ -83,6 +83,7 @@ REENTRY_DRAWDOWN_HIGHER = 12.0      # 门槛提高到 12%
 # 第三档
 TIER3_ENTRY_VXN = 25.0              # VXN < 25 连续 3 天
 TIER3_ENTRY_DAYS = 3
+TIER3_ENTRY_DRAWDOWN = 3.0          # 回撤 ≤ 3% 才触发（高位+低波动才防御）
 TIER3_EXIT_VXN = 27.0               # VXN > 27 连续 3 天
 TIER3_EXIT_DAYS = 3
 
@@ -434,14 +435,18 @@ def _determine_tier(vxn_records: list[dict], ndx_records: list[dict]) -> dict:
     current_tier = cooldown_state.get("current_tier", "tier2")
 
     # ── 第三档判断（不受冷静期影响） ──
-    if vxn_below_25_days >= TIER3_ENTRY_DAYS:
+    if vxn_below_25_days >= TIER3_ENTRY_DAYS and drawdown_abs <= TIER3_ENTRY_DRAWDOWN:
         # 检查是否应该从第三档退出
         if current_tier == "tier3" and vxn_above_27_days >= TIER3_EXIT_DAYS:
             tier = "tier2"
             reason = f"VXN > 27 连续 {vxn_above_27_days} 天，退出第三档"
         else:
             tier = "tier3"
-            reason = f"VXN < 25 连续 {vxn_below_25_days} 天，进入第三档"
+            reason = f"VXN < 25 连续 {vxn_below_25_days} 天且回撤 {drawdown_abs}% ≤ {TIER3_ENTRY_DRAWDOWN}%，进入第三档"
+    elif vxn_below_25_days >= TIER3_ENTRY_DAYS and drawdown_abs > TIER3_ENTRY_DRAWDOWN:
+        # VXN 低但市场已有回调 → 正常定投，不错过低吸机会
+        tier = "tier2"
+        reason = f"VXN < 25 连续 {vxn_below_25_days} 天，但回撤 {drawdown_abs}% > {TIER3_ENTRY_DRAWDOWN}%，维持第二档（回调后低波动是买入机会）"
     else:
         # 不在第三档条件 → 看第一档和第二档
 
@@ -522,7 +527,7 @@ def _determine_tier(vxn_records: list[dict], ndx_records: list[dict]) -> dict:
             "normal_threshold": TIER1_ENTRY_DRAWDOWN,
             "elevated_threshold": REENTRY_DRAWDOWN_HIGHER if trading_days_since_exit <= REENTRY_WINDOW_DAYS else None,
         },
-        "rules_version": "4.0.0",
+        "rules_version": "4.1.0",
     }
 
 
@@ -535,7 +540,7 @@ async def health():
     return {
         "status": "ok",
         "service": "NasdaqDCA VXN + Tier Proxy",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "timestamp": datetime.utcnow().isoformat(),
     }
 
