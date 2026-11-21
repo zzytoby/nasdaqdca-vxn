@@ -3,7 +3,7 @@ Nasdaq-100 DCA Discipline - VXN + NDX Data Proxy Backend
 =========================================================
 数据源：
   VXN: CBOE 官方  https://cdn.cboe.com/api/global/us_indices/daily_prices/VXN_History.csv
-  NDX: Yahoo Finance v8 chart API (用于计算回撤)
+  NDX: NASDAQ 官方 https://api.nasdaq.com/api/quote/NDX/historical (用于计算回撤)
 
 规则版本：v4.0 (2026-11-21)
 
@@ -54,7 +54,6 @@ VXN_SYMBOL = "^VXN"
 NDX_SYMBOL = "^NDX"
 
 CBOE_VXN_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VXN_History.csv"
-YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -146,45 +145,75 @@ def _get_vxn() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# NDX data (Yahoo Finance v8 chart API)
+# NDX data (NASDAQ 官方 API)
 # ---------------------------------------------------------------------------
+
+NASDAQ_NDX_URL = "https://api.nasdaq.com/api/quote/NDX/historical"
+
+
+def _parse_nasdaq_price(raw: str) -> float:
+    """解析 NASDAQ API 价格字符串，如 '$25,028.98' → 25028.98"""
+    return float(raw.replace("$", "").replace(",", ""))
+
 
 def _fetch_ndx() -> list[dict]:
     """
-    从 Yahoo Finance v8 chart API 拉取 NDX 最近 2 年日线数据。
-    返回记录列表（日期升序），每项含 date / close。
+    从 NASDAQ 官方 API 拉取 NDX 最近 2 年日线数据。
+    返回记录列表（日期升序），每项含 date / close / open / high / low。
     """
-    url = YAHOO_CHART_URL.format(symbol="%5ENDX")
-    params = {
-        "range": "2y",
-        "interval": "1d",
-    }
-    headers = {"User-Agent": USER_AGENT}
+    today = date.today()
+    two_years_ago = today - timedelta(days=730)
 
-    logger.info("从 Yahoo Finance 获取 NDX 数据...")
-    resp = httpx.get(url, params=params, headers=headers, timeout=30.0)
+    params = {
+        "assetclass": "index",
+        "fromdate": two_years_ago.strftime("%Y-%m-%d"),
+        "limit": 520,  # ~2 年交易日
+        "todate": today.strftime("%Y-%m-%d"),
+    }
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Referer": "https://www.nasdaq.com/",
+    }
+
+    logger.info("从 NASDAQ 官方 API 获取 NDX 数据...")
+    resp = httpx.get(NASDAQ_NDX_URL, params=params, headers=headers, timeout=30.0, follow_redirects=True)
     resp.raise_for_status()
 
     body = resp.json()
-    result = body["chart"]["result"][0]
-    timestamps = result["timestamp"]
-    quotes = result["indicators"]["quote"][0]
-    closes = quotes["close"]
+    if body.get("status", {}).get("rCode") != 200:
+        raise HTTPException(status_code=502, detail=f"NASDAQ API 返回异常: {body}")
+
+    rows = body.get("data", {}).get("tradesTable", {}).get("rows", [])
+    if not rows:
+        raise HTTPException(status_code=502, detail="NASDAQ NDX 数据为空")
 
     records = []
-    for ts, close in zip(timestamps, closes):
-        if close is None or close <= 0:
+    for row in rows:
+        try:
+            close = _parse_nasdaq_price(row["close"])
+            if close <= 0:
+                continue
+            # NASDAQ API 日期格式: "MM/DD/YYYY"
+            dt = datetime.strptime(row["date"], "%m/%d/%Y")
+            records.append({
+                "date": dt.strftime("%Y-%m-%d"),
+                "close": close,
+                "open": _parse_nasdaq_price(row["open"]) if row.get("open") and row["open"] != "N/A" else None,
+                "high": _parse_nasdaq_price(row["high"]) if row.get("high") and row["high"] != "N/A" else None,
+                "low": _parse_nasdaq_price(row["low"]) if row.get("low") and row["low"] != "N/A" else None,
+            })
+        except (ValueError, KeyError, TypeError) as e:
+            logger.warning(f"跳过无法解析的 NDX 记录: {row.get('date', '?')} — {e}")
             continue
-        dt = datetime.utcfromtimestamp(ts)
-        records.append({
-            "date": dt.strftime("%Y-%m-%d"),
-            "close": round(float(close), 2),
-        })
 
     if not records:
-        raise HTTPException(status_code=502, detail="Yahoo NDX 数据为空")
+        raise HTTPException(status_code=502, detail="NASDAQ NDX 数据解析后为空")
 
-    logger.info(f"NDX 数据获取成功: {len(records)} 条记录")
+    # 按日期升序排列（NASDAQ API 返回降序）
+    records.sort(key=lambda r: r["date"])
+
+    logger.info(f"NDX 数据获取成功: {len(records)} 条记录 ({records[0]['date']} ~ {records[-1]['date']})")
     return records
 
 
@@ -519,7 +548,7 @@ async def vxn_drawdown():
     return {
         "symbol": NDX_SYMBOL,
         **dd,
-        "source": "Yahoo Finance",
+        "source": "NASDAQ",
         "cached_at": _cache["ndx"]["ts"].isoformat() if _cache["ndx"]["ts"] else None,
     }
 
