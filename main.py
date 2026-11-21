@@ -509,7 +509,7 @@ def _determine_tier(vxn_records: list[dict], ndx_records: list[dict]) -> dict:
             "consecutive_below_25": vxn_below_25_days,
             "consecutive_above_27": vxn_above_27_days,
         },
-        "drawdown": dd,
+        "drawdown": {**dd, "symbol": NDX_SYMBOL, "source": _cache["ndx"].get("source", "NASDAQ")},
         "cooldown": {
             "in_cooldown": in_cooldown,
             "trading_days_since_exit": trading_days_since_exit,
