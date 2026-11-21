@@ -3,7 +3,7 @@ Nasdaq-100 DCA Discipline - VXN + NDX Data Proxy Backend
 =========================================================
 数据源：
   VXN: CBOE 官方  https://cdn.cboe.com/api/global/us_indices/daily_prices/VXN_History.csv
-  NDX: NASDAQ 官方 https://api.nasdaq.com/api/quote/NDX/historical (用于计算回撤)
+  NDX: NASDAQ 官方 API（优先） / FRED NASDAQ100（降级） (用于计算回撤)
 
 规则版本：v4.0 (2026-11-21)
 
@@ -91,7 +91,7 @@ TIER3_EXIT_DAYS = 3
 # ---------------------------------------------------------------------------
 _cache: dict = {
     "vxn": {"data": None, "ts": None},
-    "ndx": {"data": None, "ts": None},
+    "ndx": {"data": None, "ts": None, "source": None},
 }
 
 
@@ -149,6 +149,7 @@ def _get_vxn() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 NASDAQ_NDX_URL = "https://api.nasdaq.com/api/quote/NDX/historical"
+FRED_NDX_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=NASDAQ100"
 
 
 def _parse_nasdaq_price(raw: str) -> float:
@@ -156,7 +157,7 @@ def _parse_nasdaq_price(raw: str) -> float:
     return float(raw.replace("$", "").replace(",", ""))
 
 
-def _fetch_ndx() -> list[dict]:
+def _fetch_ndx_nasdaq() -> list[dict]:
     """
     从 NASDAQ 官方 API 拉取 NDX 最近 2 年日线数据。
     返回记录列表（日期升序），每项含 date / close / open / high / low。
@@ -213,8 +214,67 @@ def _fetch_ndx() -> list[dict]:
     # 按日期升序排列（NASDAQ API 返回降序）
     records.sort(key=lambda r: r["date"])
 
-    logger.info(f"NDX 数据获取成功: {len(records)} 条记录 ({records[0]['date']} ~ {records[-1]['date']})")
+    logger.info(f"NDX 数据获取成功(NASDAQ): {len(records)} 条记录 ({records[0]['date']} ~ {records[-1]['date']})")
     return records
+
+
+def _fetch_ndx_fred() -> list[dict]:
+    """
+    从 FRED (圣路易斯联储) 拉取 NASDAQ100 历史数据作为降级方案。
+    FRED 是政府机构数据源，无反爬、数据中心 IP 稳定可访问。
+    CSV 格式: observation_date,NASDAQ100
+    注意：FRED 数据通常滞后 1 个交易日。
+    """
+    headers = {"User-Agent": USER_AGENT, "Accept": "text/csv,*/*"}
+    logger.info("从 FRED 获取 NASDAQ100 数据（降级方案）...")
+    resp = httpx.get(FRED_NDX_URL, headers=headers, timeout=30.0, follow_redirects=True)
+    resp.raise_for_status()
+
+    reader = csv.DictReader(io.StringIO(resp.text))
+    records = []
+    for row in reader:
+        try:
+            close = float(row.get("NASDAQ100") or 0)
+            if close <= 0:
+                continue
+            dt = datetime.strptime(row["observation_date"], "%Y-%m-%d")
+            records.append({
+                "date": dt.strftime("%Y-%m-%d"),
+                "close": round(close, 2),
+                "open": None,
+                "high": None,
+                "low": None,
+            })
+        except (ValueError, KeyError, TypeError):
+            continue
+
+    if not records:
+        raise HTTPException(status_code=502, detail="FRED NASDAQ100 数据为空或解析失败")
+
+    records.sort(key=lambda r: r["date"])
+    logger.info(f"NDX 数据获取成功(FRED): {len(records)} 条记录 ({records[0]['date']} ~ {records[-1]['date']})")
+    return records
+
+
+def _fetch_ndx() -> list[dict]:
+    """
+    获取 NDX 日线数据：优先 NASDAQ 官方（最新），失败自动降级 FRED（稳定）。
+    返回记录列表（日期升序）。
+    """
+    try:
+        records = _fetch_ndx_nasdaq()
+        _cache["ndx"]["source"] = "NASDAQ"
+        return records
+    except Exception as e:
+        logger.warning(f"NASDAQ API 获取失败，降级到 FRED: {e}")
+
+    try:
+        records = _fetch_ndx_fred()
+        _cache["ndx"]["source"] = "FRED"
+        return records
+    except Exception as e:
+        logger.error(f"FRED 数据源也失败: {e}")
+        raise HTTPException(status_code=502, detail=f"NDX 数据源全部失败: {e}")
 
 
 def _get_ndx() -> list[dict]:
@@ -548,7 +608,7 @@ async def vxn_drawdown():
     return {
         "symbol": NDX_SYMBOL,
         **dd,
-        "source": "NASDAQ",
+        "source": _cache["ndx"].get("source", "NASDAQ"),
         "cached_at": _cache["ndx"]["ts"].isoformat() if _cache["ndx"]["ts"] else None,
     }
 
